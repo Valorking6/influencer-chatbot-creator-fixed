@@ -1,11 +1,16 @@
-""
-Fixed image-to-video module that generates actual video prompts instead of instructions.
+"""
+GPU-optimized image-to-video module with CUDA acceleration.
 """
 
 import torch
 from diffusers import DiffusionPipeline
 from PIL import Image
 import random
+import logging
+from utils.gpu import get_device, get_optimal_dtype, configure_model_for_gpu, optimize_memory
+from utils.perf import track_model_operation
+
+logger = logging.getLogger(__name__)
 
 class ImageToVideoGenerator:
     def __init__(self, model_config):
@@ -13,40 +18,78 @@ class ImageToVideoGenerator:
         self.num_inference_steps = model_config["num_inference_steps"]
         self.guidance_scale = model_config["guidance_scale"]
         
-        # Load the video generation pipeline
-        self.pipeline = DiffusionPipeline.from_pretrained(
-            self.model_id,
-            torch_dtype=torch.float16,
-            device_map="auto"
-        )
+        # Get optimal device and dtype
+        self.device = get_device()
+        self.dtype = get_optimal_dtype()
+        
+        logger.info(f"Loading image-to-video model on {self.device} with dtype {self.dtype}")
+        
+        # Load the video generation pipeline with GPU optimization
+        with track_model_operation("load_image_to_video"):
+            self.pipeline = DiffusionPipeline.from_pretrained(
+                self.model_id,
+                torch_dtype=self.dtype,
+                device_map="auto" if self.device.type == "cuda" else None,
+                low_cpu_mem_usage=True,
+                use_safetensors=True,
+                variant="fp16" if self.dtype == torch.float16 else None
+            )
+            
+            # Configure pipeline for optimal GPU performance
+            if self.device.type == "cuda":
+                self.pipeline = self.pipeline.to(self.device)
+                
+                # Enable memory efficient attention if available
+                if hasattr(self.pipeline.unet, 'set_use_memory_efficient_attention_xformers'):
+                    try:
+                        self.pipeline.enable_xformers_memory_efficient_attention()
+                        logger.info("Enabled xformers memory efficient attention")
+                    except Exception as e:
+                        logger.warning(f"Could not enable xformers: {e}")
+                
+                # Enable attention slicing for memory efficiency
+                if hasattr(self.pipeline, 'enable_attention_slicing'):
+                    self.pipeline.enable_attention_slicing()
+                    logger.info("Enabled attention slicing")
+                
+                # Enable CPU offloading if needed for large models
+                if hasattr(self.pipeline, 'enable_model_cpu_offload'):
+                    try:
+                        # Only enable if we have limited GPU memory
+                        gpu_memory = torch.cuda.get_device_properties(self.device).total_memory / 1024**3
+                        if gpu_memory < 16:  # Less than 16GB
+                            self.pipeline.enable_model_cpu_offload()
+                            logger.info("Enabled model CPU offloading for memory efficiency")
+                    except Exception as e:
+                        logger.warning(f"Could not enable CPU offloading: {e}")
+                
+                # Optimize memory after loading
+                optimize_memory()
+        
+        logger.info("Image-to-video model loaded successfully")
         
     def generate_video_prompt(self, image_path_or_pil, style_preference="cinematic"):
         """
         Generate an actual video prompt from an image, not instructions.
-        
-        Args:
-            image_path_or_pil: Path to image file or PIL Image object
-            style_preference: Style of video to generate
-            
-        Returns:
-            str: Detailed video generation prompt
         """
         try:
-            # Load image if path provided
-            if isinstance(image_path_or_pil, str):
-                image = Image.open(image_path_or_pil).convert('RGB')
-            else:
-                image = image_path_or_pil.convert('RGB')
-            
-            # Analyze image content (simplified - in real implementation would use vision model)
-            image_analysis = self._analyze_image_content(image)
-            
-            # Generate video prompt based on image content
-            video_prompt = self._create_video_prompt(image_analysis, style_preference)
-            
-            return video_prompt
-            
+            with track_model_operation("video_prompt_generation"):
+                # Load image if path provided
+                if isinstance(image_path_or_pil, str):
+                    image = Image.open(image_path_or_pil).convert('RGB')
+                else:
+                    image = image_path_or_pil.convert('RGB')
+                
+                # Analyze image content (simplified - in real implementation would use vision model)
+                image_analysis = self._analyze_image_content(image)
+                
+                # Generate video prompt based on image content
+                video_prompt = self._create_video_prompt(image_analysis, style_preference)
+                
+                return video_prompt
+                
         except Exception as e:
+            logger.error(f"Error in video prompt generation: {e}")
             return f"Error generating video prompt: {str(e)}"
     
     def _analyze_image_content(self, image):
@@ -136,29 +179,56 @@ class ImageToVideoGenerator:
     def generate_video_from_prompt(self, prompt, output_path="generated_video.mp4"):
         """
         Generate actual video from prompt using the diffusion pipeline.
-        
-        Args:
-            prompt: Video generation prompt
-            output_path: Path to save generated video
-            
-        Returns:
-            str: Path to generated video file
+        GPU-optimized with memory management.
         """
         try:
-            # Generate video using the pipeline
-            video_frames = self.pipeline(
-                prompt,
-                num_inference_steps=self.num_inference_steps,
-                guidance_scale=self.guidance_scale,
-                height=512,
-                width=512,
-                num_frames=16
-            ).frames[0]
-            
-            # Save video frames as MP4 (simplified - would need proper video encoding)
-            # In practice, use cv2 or moviepy to create actual video file
-            
-            return output_path
-            
+            with track_model_operation("video_generation"):
+                logger.info(f"Generating video with prompt: {prompt[:100]}...")
+                
+                # Generate video using the pipeline with GPU optimization
+                if self.device.type == "cuda" and self.dtype == torch.float16:
+                    with torch.cuda.amp.autocast():
+                        video_frames = self.pipeline(
+                            prompt,
+                            num_inference_steps=self.num_inference_steps,
+                            guidance_scale=self.guidance_scale,
+                            height=512,
+                            width=512,
+                            num_frames=16,
+                            generator=torch.Generator(device=self.device).manual_seed(42)
+                        ).frames[0]
+                else:
+                    video_frames = self.pipeline(
+                        prompt,
+                        num_inference_steps=self.num_inference_steps,
+                        guidance_scale=self.guidance_scale,
+                        height=512,
+                        width=512,
+                        num_frames=16,
+                        generator=torch.Generator(device=self.device).manual_seed(42)
+                    ).frames[0]
+                
+                # Clear GPU cache after generation
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                
+                # Save video frames as MP4 (simplified - would need proper video encoding)
+                # In practice, use cv2 or moviepy to create actual video file
+                logger.info(f"Video generation completed. Frames: {len(video_frames)}")
+                
+                return output_path
+                
         except Exception as e:
-            return f"Error generating video: {str(e)}
+            logger.error(f"Error in video generation: {e}")
+            return f"Error generating video: {str(e)}"
+    
+    def get_model_info(self):
+        """Get information about the loaded model."""
+        return {
+            "model_id": self.model_id,
+            "device": str(self.device),
+            "dtype": str(self.dtype),
+            "num_inference_steps": self.num_inference_steps,
+            "guidance_scale": self.guidance_scale,
+            "pipeline_components": list(self.pipeline.components.keys()) if hasattr(self.pipeline, 'components') else []
+        }
